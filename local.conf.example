@@ -1,0 +1,2 @@
+# Copy to local.conf and set your receiver's LAN IPv4 address.
+CONFIG_HID_WIFI_HOST_IPV4="192.0.2.1"

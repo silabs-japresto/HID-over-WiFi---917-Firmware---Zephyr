@@ -1,0 +1,14 @@
+mainmenu "HID over Wi-Fi"
+
+source "Kconfig.zephyr"
+
+config HID_WIFI_HOST_IPV4
+    string "IPv4 address of the UDP receiver"
+    default "192.0.2.1"
+    help
+      Set this to the host computer's LAN IPv4 address in local.conf.
+
+config HID_WIFI_HOST_PORT
+    int "UDP receiver port"
+    default 5004
+    range 1 65535

@@ -1,0 +1,21 @@
+# Zephyr and West workspaces are external to this application.
+build/
+build-*/
+.west/
+zephyr/
+zephyr-silabs/
+modules/
+bootloader/
+tools/
+.venv/
+__pycache__/
+*.rps
+*.elf
+*.hex
+*.bin
+
+# Receiver location and local editor state.
+local.conf
+.DS_Store
+.codex/
+.vscode/
