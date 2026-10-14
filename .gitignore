@@ -14,7 +14,7 @@ __pycache__/
 *.hex
 *.bin
 
-# Receiver location and local editor state.
+# Local configuration and editor state.
 local.conf
 .DS_Store
 .codex/

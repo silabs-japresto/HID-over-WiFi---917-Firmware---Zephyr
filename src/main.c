@@ -24,6 +24,10 @@
 #define REFRESH_MS 50
 #define RECONNECT_MS 1000
 #define WIFI_TIMEOUT_MS 40000
+#define DISCOVERY_PORT 5005
+#define HOST_LEASE_MS 4000
+static const uint8_t discovery_query[] = {'H', 'W', '?', 1};
+static const uint8_t host_magic[] = {'H', 'W', 'H', 1};
 #define SERVICE_UUID BT_UUID_DECLARE_16(0xAABB)
 #define COMMAND_UUID BT_UUID_DECLARE_16(0x1AA1)
 #define STATUS_UUID BT_UUID_DECLARE_16(0x1BB1)
@@ -243,7 +247,11 @@ static void network_event(struct net_mgmt_event_callback *cb, uint64_t event,
 	} else if (event == NET_EVENT_IPV4_ADDR_ADD || event == NET_EVENT_IPV4_DHCP_BOUND) {
 		atomic_set(&ipv4_ready, 1);
 		atomic_set(&provision_status, 2);
-		printk("Wi-Fi has an IPv4 address\n");
+		struct net_in_addr *address = net_if_ipv4_get_global_addr(iface, NET_ADDR_PREFERRED);
+		char text[NET_IPV4_ADDR_LEN];
+		if (address != NULL && zsock_inet_ntop(AF_INET, address, text, sizeof(text)) != NULL) {
+			printk("Wi-Fi IPv4 address: %s\n", text);
+		}
 	}
 }
 
@@ -300,14 +308,12 @@ int main(void)
 	if (stored.ssid[0] != '\0') {
 		printk("Wi-Fi connect request: %d\n", start_wifi(&stored));
 	}
-	struct sockaddr_in host = {
-		.sin_family = AF_INET,
-		.sin_port = htons(CONFIG_HID_WIFI_HOST_PORT),
-	};
-	if (zsock_inet_pton(AF_INET, CONFIG_HID_WIFI_HOST_IPV4, &host.sin_addr) != 1) {
-		printk("Invalid host IPv4 address\n");
-		return 0;
-	}
+	struct sockaddr_in host = {.sin_family = AF_INET};
+	bool have_host = false;
+	int discovery_sock = -1;
+	int64_t host_seen = 0;
+	int64_t last_query = -1000;
+	int64_t last_discovery_open = -1000;
 	int sock = -1;
 	uint8_t packet[6] = {'H', 'W', 1, 0, 0, 0};
 	uint8_t last_state = 0xff;
@@ -319,6 +325,11 @@ int main(void)
 	for (;;) {
 		struct wifi_credentials received;
 		if (k_msgq_get(&credentials_queue, &received, K_NO_WAIT) == 0) {
+			if (discovery_sock >= 0) {
+				zsock_close(discovery_sock);
+				discovery_sock = -1;
+			}
+			have_host = false;
 			if (sock >= 0) {
 				zsock_close(sock);
 				sock = -1;
@@ -365,9 +376,16 @@ int main(void)
 			net_dhcpv4_start(wifi_iface);
 			printk("IPv4 DHCP started\n");
 		}
-		if (!ready && was_ready && sock >= 0) {
-			zsock_close(sock);
-			sock = -1;
+		if (!ready && was_ready) {
+			if (sock >= 0) {
+				zsock_close(sock);
+				sock = -1;
+			}
+			if (discovery_sock >= 0) {
+				zsock_close(discovery_sock);
+				discovery_sock = -1;
+			}
+			have_host = false;
 		}
 		was_ready = ready;
 		if (stored.ssid[0] != '\0' && !ready && !atomic_get(&wifi_connected) &&
@@ -381,6 +399,78 @@ int main(void)
 			}
 		}
 		if (ready) {
+			if (have_host && now - host_seen >= HOST_LEASE_MS) {
+				have_host = false;
+				printk("HID host expired; searching again\n");
+			}
+			if (discovery_sock < 0 && now - last_discovery_open >= 1000) {
+				last_discovery_open = now;
+				discovery_sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+				if (discovery_sock >= 0) {
+					struct sockaddr_in local = {
+						.sin_family = AF_INET,
+						.sin_port = htons(DISCOVERY_PORT),
+					};
+					/* Zephyr's native UDP stack permits broadcast without SO_BROADCAST. */
+					if (zsock_bind(discovery_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+						printk("HID discovery bind failed: %d\n", errno);
+						zsock_close(discovery_sock);
+						discovery_sock = -1;
+					} else {
+						last_query = now - 1000;
+						printk("HID host discovery listening on UDP %u\n", DISCOVERY_PORT);
+					}
+				} else {
+					printk("HID discovery socket failed: %d\n", errno);
+				}
+			}
+			if (discovery_sock >= 0) {
+				if ((!have_host || now - host_seen >= 1500) && now - last_query >= 1000) {
+					struct sockaddr_in probe = host;
+					probe.sin_port = htons(DISCOVERY_PORT);
+					if (!have_host) {
+						probe.sin_addr.s_addr = INADDR_BROADCAST;
+					}
+					if (zsock_sendto(discovery_sock, discovery_query, sizeof(discovery_query),
+						MSG_DONTWAIT, (struct sockaddr *)&probe, sizeof(probe)) < 0) {
+						printk("HID discovery probe failed: %d\n", errno);
+					}
+					last_query = now;
+				}
+				/* Bound receive work so discovery never stalls button polling. */
+				for (int i = 0; i < 4; ++i) {
+					uint8_t announcement[64];
+					struct sockaddr_in source;
+					socklen_t source_length = sizeof(source);
+					int size = zsock_recvfrom(discovery_sock, announcement, sizeof(announcement),
+						MSG_DONTWAIT, (struct sockaddr *)&source, &source_length);
+					if (size < 0) {
+						break;
+					}
+					if (size != 8 || memcmp(announcement, host_magic, sizeof(host_magic)) != 0 ||
+					    announcement[6] != 0 || announcement[7] != 0 ||
+					    source.sin_port != htons(DISCOVERY_PORT) || source.sin_addr.s_addr == 0) {
+						continue;
+					}
+					uint16_t port = ((uint16_t)announcement[4] << 8) | announcement[5];
+					if (port == 0) {
+						continue;
+					}
+					if (!have_host || (host.sin_addr.s_addr == source.sin_addr.s_addr &&
+							  host.sin_port == htons(port))) {
+						if (!have_host) {
+							last_state = 0xff;
+							printk("HID host discovered on UDP port %u\n", port);
+						}
+						host = source;
+						host.sin_port = htons(port);
+						host_seen = now;
+						have_host = true;
+					}
+				}
+			}
+		}
+		if (ready && have_host) {
 			if (sock < 0) {
 				sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 			}
@@ -388,7 +478,7 @@ int main(void)
 			if (sock >= 0 && (state != last_state || now - last_sent >= REFRESH_MS)) {
 				packet[3]++;
 				packet[4] = state;
-				int sent = zsock_sendto(sock, packet, sizeof(packet), 0,
+				int sent = zsock_sendto(sock, packet, sizeof(packet), MSG_DONTWAIT,
 					(const struct sockaddr *)&host, sizeof(host));
 				if (sent == sizeof(packet)) {
 					last_state = state;

@@ -4,7 +4,7 @@
 
 Zephyr application for the SiWG917 BRD4338A radio board. The two kit buttons send gamepad A and B states to the [HID over Wi-Fi Host](https://github.com/silabs-japresto/HID-over-WiFi---Host) receiver. BTN0 maps to HID Button usage 1 (A); BTN1 maps to Button usage 2 (B). The board's joystick is unavailable with this radio board.
 
-The board advertises as `HID-WIFI-917` over BLE for Wi-Fi provisioning. It remembers Wi-Fi credentials and BLE bonds in Zephyr settings storage, rejoins Wi-Fi after reset, and sends six-byte UDP packets to a configured LAN receiver. Buttons are polled every 5 ms. A packet is sent on state change and every 50 ms while connected. The host releases buttons after 250 ms without packets.
+The board advertises as `HID-WIFI-917` over BLE for Wi-Fi provisioning. It remembers Wi-Fi credentials and BLE bonds in Zephyr settings storage, rejoins Wi-Fi after reset, and sends six-byte UDP packets to an automatically discovered LAN receiver. Buttons are polled every 5 ms. A packet is sent on state change and every 50 ms while connected. The host releases buttons after 250 ms without packets.
 
 ## Build
 
@@ -19,13 +19,23 @@ west blobs fetch hal_silabs
 west sdk install -t arm-zephyr-eabi
 ```
 
-Clone this application separately. Copy `local.conf.example` to `local.conf`, then set `CONFIG_HID_WIFI_HOST_IPV4` to the receiver's LAN IPv4 address. `local.conf` is ignored by Git. From the West workspace, build with:
+Clone this application separately. From the West workspace, build with `APPLICATION_DIRECTORY` set to the cloned application directory:
 
 ```sh
-west build -p always -b siwx917_rb4338a /path/to/this/application -- -DEXTRA_CONF_FILE=local.conf
+west build -p always -b siwx917_rb4338a APPLICATION_DIRECTORY
 ```
 
 The build output is `build/zephyr/zephyr.rps`. Flash with `west flash` using the debug adapter. The SiWG917 also needs compatible NWP connectivity firmware for the SDK release; see the Silicon Labs [board and firmware setup guide](https://docs.silabs.com/zephyr/latest/zephyr-getting-started/getting-started-guide).
+
+## Automatic host discovery
+
+Start `app.py` or `headless.py` on the receiving computer. The host advertises its UDP listening port once per second on UDP port 5005 on each active IPv4 network interface. The controller learns the host's IP address from the advertisement's source address and sends its button packets directly to the advertised port (5004 by default). No receiver IP address is compiled into the firmware, and no receiver configuration file is required.
+
+The controller keeps the first discovered host while its advertisements continue. After four seconds without an advertisement or probe reply, it stops sending to that endpoint and searches again. A host restart, changed IP address, or changed `--port` is handled automatically. Controllers also send a small broadcast probe while searching. If advertisements from a selected host are missed, the controller sends unicast renewal probes to that host. Run one receiver per computer; if multiple computers advertise, the controller selects the first one it finds.
+
+Discovery requires the board and receiver to be on the same IPv4 broadcast network. Allow inbound UDP 5005 and the receiver's data port in the host firewall. Wi-Fi client isolation or VLAN boundaries can prevent discovery. Wi-Fi credentials are still configured separately through BLE.
+
+Discovery advertisements are eight bytes: ASCII `HWH`, version `1`, the receiver port as a two-byte unsigned integer in network byte order, and two zero bytes. The sender's IPv4 address supplies the endpoint address. Discovery probes are four bytes: ASCII `HW?` followed by version `1`. Both use UDP 5005. Advertisements and button packets are unauthenticated; use a trusted LAN.
 
 ## Provision and receive
 
