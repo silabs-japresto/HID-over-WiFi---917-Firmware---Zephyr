@@ -17,5 +17,6 @@ __pycache__/
 # Local configuration and editor state.
 local.conf
 .DS_Store
+.claude/
 .codex/
 .vscode/
